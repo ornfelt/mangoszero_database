@@ -28,8 +28,8 @@ updaterealmDB="YES"
 addRealmList="YES"
 
 svr_def="localhost"
-user_def="mangos"
-pass_def="mangos"
+user_def="mangoszero"
+pass_def="mangoszero"
 port_def="3306"
 wdb_def="mangos0"
 cdb_def="character0"
@@ -93,166 +93,165 @@ determineDBName()
 		dbname="MySQL"
 	else
 		printf "Did not find mariadb or mysql.\n"
+		exit 1
 	fi
 }
 
-mysqlconfigeditor()
+readPassword()
 {
-	dbconfig="mysql_config_editor set --login-path=local --host=${svr} --port=${port} --user=${user} --password --skip-warn"
+	# No echo when typed; read plainly when the answers are piped in.
+	if [ -t 0 ]; then
+		stty -echo
+		read pass
+		stty echo
+		printf "\n"
+	else
+		read pass
+	fi
 }
 
 determineDBCommand()
 {
+	# The connection goes in an option file only this user can read, removed on exit,
+	# so the password is neither on the command line nor stored by mysql_config_editor.
+	dbconf=$(mktemp)
+	trap 'rm -f "${dbconf}"' EXIT
+	trap 'exit 1' INT TERM
+	chmod 600 "${dbconf}"
+	escaped_pass=$(printf "%s" "${pass}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	printf "[client]\nhost=%s\nport=%s\nuser=%s\npassword=\"%s\"\n" "${svr}" "${port}" "${user}" "${escaped_pass}" > "${dbconf}"
+
 	if [ $dbname = "MariaDB" ]; then
-		dbcommand="mariadb -h ${svr} -u ${user} -p${pass} -q -s"
+		dbcommand="mariadb --defaults-extra-file=${dbconf} -q -s"
 	elif [ $dbname = "MySQL" ]; then
-		dbcommand="mysql --login-path=local -q -s"
+		dbcommand="mysql --defaults-extra-file=${dbconf} -q -s"
 	else
 		printf "Did not find mariadb or mysql.\n"
 	fi
 }
 
+# runSql <database> <sql file>
+# The update files create their procedure as DEFINER=`root`@`localhost`, which only a
+# SUPER / SET_ANY_DEFINER account may do; without the clause the procedure belongs to the
+# connecting user. An update procedure swallows its sql errors and reports
+# '* UPDATE FAILED *' instead, so that output counts as a failure too.
+runSql()
+{
+	output=$(sed 's/DEFINER=`[^`]*`@`[^`]*`//g' "$2" | ${dbcommand} "$1" 2>&1)
+	status=$?
+	if [ -n "${output}" ]; then
+		printf "%s\n" "${output}"
+	fi
+	if [ ${status} -ne 0 ]; then
+		return 1
+	fi
+	case "${output}" in
+		*"UPDATE FAILED"*) return 1;;
+	esac
+	return 0
+}
+
+# runSqlDir <database> <dir> <verb>   every .sql in the dir, sorted; a missing dir is skipped
+runSqlDir()
+{
+	for file in "$2"/*.sql
+	do
+		[ -e "${file}" ] || continue
+		printf "$3 ${file}\n"
+		runSql "$1" "${file}" || return 1
+		printf "File ${file} imported\n"
+	done
+}
+
 createCharDB()
 {
 	printf "Creating Character database ${cdb}\n"
-	$(${dbcommand} -e "Create database ${cdb}")
+	${dbcommand} -e "CREATE DATABASE IF NOT EXISTS \`${cdb}\`" || return 1
 
 	if [ "${loadcharDB}" = "YES" ]; then
-		loadCharDB
+		loadCharDB || return 1
 	fi
 }
 
 loadCharDB()
 {
 	printf "Loading data into character database ${cdb}\n"
-	$(${dbcommand} ${cdb} < Character/Setup/characterLoadDB.sql)
+	runSql "${cdb}" Character/Setup/characterLoadDB.sql
 }
 
 updateCharDB()
 {
 	printf "Updating data into the character database ${cdb}\n"
-	for file in $(ls Character/Updates/${OLDRELEASE}/*.sql | tr ' ' '|' | tr '\n' ' ')
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Applying update ${file}\n"
-		${dbcommand} "${cdb}" < "${file}" || return 1
-		printf "File ${file} imported\n"
-	done
-
-	for file in $(ls Character/Updates/${RELEASE}/*.sql | tr ' ' '|' | tr '\n' ' ')
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Applying update ${file}\n"
-		${dbcommand} "${cdb}" < "${file}" || return 1
-		printf "File ${file} imported\n"
-	done
+	runSqlDir "${cdb}" Character/Updates/${OLDRELEASE} "Applying update" || return 1
+	runSqlDir "${cdb}" Character/Updates/${RELEASE} "Applying update"
 }
 
 createWorldDB()
 {
 	printf "Creating World database ${wdb}\n"
-	$(${dbcommand} -e "Create database ${wdb}")
+	${dbcommand} -e "CREATE DATABASE IF NOT EXISTS \`${wdb}\`" || return 1
 
 	if [ "${loadworldDB}" = "YES" ]; then
-		loadWorldDB
+		loadWorldDB || return 1
 	fi
 }
 
 loadWorldDB()
 {
 	printf "Loading data into world database ${wdb}\n"
-	$(${dbcommand} ${wdb} < World/Setup/mangosdLoadDB.sql)
+	runSql "${wdb}" World/Setup/mangosdLoadDB.sql || return 1
 
 	if [ "${dbType}" = "POPULATED" ]; then
-		populateWorldDB
+		populateWorldDB || return 1
 	fi
 }
 
 populateWorldDB()
 {
 	printf "Importing World database ${wdb}\n"
-	for file in $(ls World/Setup/FullDB/${OLDRELEASE}/*.sql | tr ' ' '|' | tr '\n' ' ') 
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Importing file ${file}\n"
-		$(${dbcommand} ${wdb} < ${file})
-		printf "File ${file} imported\n"
-	done
-
-	for file in $(ls World/Setup/FullDB/*.sql | tr ' ' '|' | tr '\n' ' ') 
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Importing file ${file}\n"
-		$(${dbcommand} ${wdb} < ${file})
-		printf "File ${file} imported\n"
-	done
+	runSqlDir "${wdb}" World/Setup/FullDB/${OLDRELEASE} "Importing file" || return 1
+	runSqlDir "${wdb}" World/Setup/FullDB "Importing file"
 }
 
 updateWorldDB()
 {
     printf "Updating data into the World database ${wdb}\n"
-    for file in World/Updates/${OLDRELEASE}/*.sql
-    do
-        [ -e "${file}" ] || continue
-        printf "Applying update ${file}\n"
-        ${dbcommand} "${wdb}" < "${file}" || return 1
-        printf "File ${file} imported\n"
-    done
-
-    for file in World/Updates/${RELEASE}/*.sql
-    do
-        [ -e "${file}" ] || continue
-        printf "Applying update ${file}\n"
-        ${dbcommand} "${wdb}" < "${file}" || return 1
-        printf "File ${file} imported\n"
-    done
+    runSqlDir "${wdb}" World/Updates/${OLDRELEASE} "Applying update" || return 1
+    runSqlDir "${wdb}" World/Updates/${RELEASE} "Applying update"
 }
 
 createRealmDB()
 {
 	printf "Creating realm database ${rdb}\n"
-	$(${dbcommand} -e "Create database ${rdb}")
+	${dbcommand} -e "CREATE DATABASE IF NOT EXISTS \`${rdb}\`" || return 1
 
 	if [ "${loadrealmDB}" = "YES" ]; then
-		loadRealmDB
+		loadRealmDB || return 1
 	fi
 }
 
 loadRealmDB()
 {
 	printf "Loading data into realm database ${rdb}\n"	
-	$(${dbcommand} ${rdb} < Realm/Setup/realmdLoadDB.sql)
+	runSql "${rdb}" Realm/Setup/realmdLoadDB.sql
 }
 
 updateRealmDB()
 {
 	printf "Updating data into the Realm database ${rdb}\n"
-	for file in $(ls Realm/Updates/${OLDRELEASE}/*.sql | tr ' ' '|' | tr '\n' ' ')
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Applying update ${file}\n"
-		${dbcommand} "${rdb}" < "${file}" || return 1
-		printf "File ${file} imported\n"
-	done
-
-	for file in $(ls Realm/Updates/${RELEASE}/*.sql | tr ' ' '|' | tr '\n' ' ')
-	do
-		file=$(echo ${file} | tr '|' ' ')
-		printf "Applying update ${file}\n"
-		${dbcommand} "${rdb}" < "${file}" || return 1
-		printf "File ${file} imported\n"
-	done
+	runSqlDir "${rdb}" Realm/Updates/${OLDRELEASE} "Applying update" || return 1
+	runSqlDir "${rdb}" Realm/Updates/${RELEASE} "Applying update"
 }
 
 addRealmList()
 {
 	printf "Adding realm list entries\n"
-	$(${dbcommand} ${rdb} < Tools/updateRealm.sql)
+	runSql "${rdb}" Tools/updateRealm.sql
 }
 
 activity=""
 
-while getopts "suh" o; do
+while getopts "suhd" o; do
 	case "${o}" in
 		s)
 			activity="N"
@@ -267,6 +266,7 @@ while getopts "suh" o; do
 			loadworldDB="NO"
 			loadrealmDB="NO"
 			dbType="EMPTY"
+			addRealmList="NO"
 			printf "You selected update only\n"
 			;;
 		d)
@@ -364,6 +364,8 @@ do
 				addRealmList="YES"
 			fi
 			;;
+		"N")
+			;;
 		"X")
 			exit 0;;
 		*)
@@ -382,20 +384,10 @@ user=${user:-${user_def}}
 printf "What is your ${dbname} port ?\t[${port_def}]: "
 read port
 port=${port:-${port_def}}
-if [ $dbname = "MariaDB" ]; then
-	printf "What is your ${dbname} password ?\t []: "
-	read pass
-	pass=${pass:-${pass_def}}
-elif [ $dbname = "MySQL" ]; then
-	mysqlconfigeditor
-	$dbconfig
-fi
+printf "What is your ${dbname} password ?\t[]: "
+readPassword
+pass=${pass:-${pass_def}}
 determineDBCommand
-
-if [ "${DUMP}" = "YES" ]; then
-	printf "Enter it again \t[]: "
-	read pass
-fi
 
 if [ "${createcharDB}" = "YES" ] || [ "${loadcharDB}" = "YES" ] || [ "${updatecharDB}" = "YES" ]; then
 	printf "What is your Character database name ?\t[${cdb_def}]: "
@@ -416,15 +408,24 @@ if [ "${createrealmDB}" = "YES" ] || [ "${loadrealmDB}" = "YES" ] || [ "${update
 fi
 
 if [ "${createcharDB}" = "YES" ]; then
-	createCharDB
+	if ! createCharDB; then
+		printf "Character database creation failed.\n"
+		exit 1
+	fi
 fi
 
 if [ "${createworldDB}" = "YES" ]; then
-	createWorldDB
+	if ! createWorldDB; then
+		printf "World database creation failed.\n"
+		exit 1
+	fi
 fi
 
 if [ "${createrealmDB}" = "YES" ]; then
-	createRealmDB
+	if ! createRealmDB; then
+		printf "Realm database creation failed.\n"
+		exit 1
+	fi
 fi
 
 if [ "${updatecharDB}" = "YES" ]; then
@@ -449,7 +450,10 @@ if [ "${updaterealmDB}" = "YES" ]; then
 fi
 
 if [ "${addRealmList}" = "YES" ]; then
-	addRealmList
+	if ! addRealmList; then
+		printf "Adding the realm list entry failed.\n"
+		exit 1
+	fi
 fi
 
 if [ "${DUMP}" = "YES" ]; then
